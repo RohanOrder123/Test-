@@ -1,0 +1,324 @@
+name: Build RC Android APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
+env:
+  SHERPA_VERSION: "1.13.8"
+  MODELS_URL: https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models
+  HI_VOICE: hi_IN-priyamvada-medium
+  HI_BUNDLE: vits-piper-hi_IN-priyamvada-medium
+  HI_BYTES: "67240610"
+  HI_SHA256: 399d91cc97eb288725633261f26b715f9a971e3bf7ec4fa1d7910cd0080d37eb
+  EN_VOICE: en_US-amy-medium
+  EN_BUNDLE: vits-piper-en_US-amy-medium
+  EN_BYTES: "67223746"
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Check required files
+        run: |
+          # capacitor_config.json (underscore) -> capacitor.config.json (dot)
+          if [ ! -f capacitor.config.json ] && [ -f capacitor_config.json ]; then
+            mv capacitor_config.json capacitor.config.json
+            echo "Renamed capacitor_config.json -> capacitor.config.json"
+          fi
+          missing=0
+          for f in index.html package.json capacitor.config.json voice-bridge-entry.js va-nlu.js va-io.js va-app.js va-core.js va-ui.js va-brain.js va-pro.js va-piper.js native/SherpaTtsPlugin.java rc-debug.keystore; do
+            if [ ! -f "$f" ]; then echo "::error::Missing file in repo root: $f"; missing=1; fi
+          done
+          if [ "$missing" = "1" ]; then exit 1; fi
+          grep -q "voice-bridge.js" index.html || echo "::warning::index.html has no voice-bridge.js script tag - native mic / phone voice will not work"
+          grep -q "va-piper.js" index.html || { echo "::error::index.html does not load va-piper.js"; exit 1; }
+          echo "All required files present."
+
+      - name: Install dependencies (locked if package-lock.json exists)
+        run: |
+          if [ -f package-lock.json ]; then
+            echo "package-lock.json found - exact versions (npm ci)"
+            npm ci --no-audit --no-fund --legacy-peer-deps
+          else
+            echo "::warning::package-lock.json missing - versions may drift. Download the 'package-lock' artifact from this run and upload it to the repo root."
+            npm install --no-audit --no-fund --legacy-peer-deps
+          fi
+          {
+            echo "### Resolved plugin versions"
+            npm ls @capacitor/core @capacitor/android @capacitor/cli @capacitor/filesystem @capacitor/share @capacitor-community/speech-recognition @capacitor-community/text-to-speech --depth=0 2>/dev/null || true
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Save lockfile as artifact (commit it once for stable builds)
+        if: ${{ hashFiles('package-lock.json') == '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-lock
+          path: package-lock.json
+          retention-days: 30
+
+      - name: Run tests (only if the tests folder was uploaded)
+        run: |
+          for t in tests/nlu-quick.js tests/va-tests.js tests/piper-mock.js; do
+            if [ -f "$t" ]; then node "$t"; else echo "$t not present - skipped"; fi
+          done
+
+      - name: Prepare web assets and bundle native voice bridge
+        run: |
+          mkdir -p www
+          cp index.html va-*.js www/
+          for f in manifest.json sw.js icon-192.png icon-512.png icon-maskable-512.png; do
+            if [ -f "$f" ]; then cp "$f" www/; else echo "optional file missing, skipped: $f"; fi
+          done
+          npm run build:voice
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Patch generated AndroidManifest (speech services + microphone)
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const p = 'android/app/src/main/AndroidManifest.xml';
+          if (!fs.existsSync(p)) { console.error('Manifest not found: ' + p); process.exit(1); }
+          let x = fs.readFileSync(p, 'utf8');
+          let add = '';
+          ['android.permission.INTERNET',
+           'android.permission.RECORD_AUDIO',
+           'android.permission.MODIFY_AUDIO_SETTINGS'].forEach(function (n) {
+            if (x.indexOf('android:name="' + n + '"') === -1)
+              add += '    <uses-permission android:name="' + n + '" />\n';
+          });
+          if (x.indexOf('android.hardware.microphone') === -1)
+            add += '    <uses-feature android:name="android.hardware.microphone" android:required="false" />\n';
+          const actions = ['android.speech.RecognitionService',
+                           'android.intent.action.TTS_SERVICE',
+                           'android.speech.tts.engine.INSTALL_TTS_DATA'];
+          const need = actions.filter(function (a) { return x.indexOf('android:name="' + a + '"') === -1; });
+          const intents = need.map(function (a) {
+            return '        <intent><action android:name="' + a + '" /></intent>\n';
+          }).join('');
+          if (intents) {
+            if (/<\/queries>/.test(x)) x = x.replace('</queries>', intents + '    </queries>');
+            else add += '    <queries>\n' + intents + '    </queries>\n';
+          }
+          if (add) {
+            if (!/<\/manifest>/.test(x)) { console.error('Invalid manifest (no </manifest>)'); process.exit(1); }
+            x = x.replace('</manifest>', add + '</manifest>');
+          }
+          fs.writeFileSync(p, x);
+          console.log('Manifest patched. Added: ' + (add ? 'yes' : 'nothing (already patched)'));
+          NODE
+
+      - name: Generate Android launcher icons
+        continue-on-error: true
+        run: |
+          if [ -f assets/icon.png ]; then
+            npx @capacitor/assets generate --android --iconBackgroundColor '#06080e' --iconBackgroundColorDark '#06080e' --splashBackgroundColor '#06080e' --splashBackgroundColorDark '#06080e'
+          else
+            echo "assets/icon.png not found - default launcher icon will be used"
+          fi
+
+      - name: Sync Capacitor plugins and web assets
+        run: npx cap sync android
+
+      - name: Force Java 17 in native plugins (fix invalid source release 21)
+        run: |
+          for f in node_modules/@capacitor-community/*/android/build.gradle node_modules/@capacitor/*/android/build.gradle; do
+            [ -f "$f" ] || continue
+            sed -i -E 's/VERSION_(1[89]|2[0-9])/VERSION_17/g; s/(sourceCompatibility|targetCompatibility)[ =]+"?(1[89]|2[0-9])"?/\1 JavaVersion.VERSION_17/g; s/jvmTarget *= *"?(1[89]|2[0-9])"?/jvmTarget = "17"/g' "$f"
+            echo "== $f"; grep -nE "Compatibility|jvmTarget|VERSION_" "$f" || true
+          done
+          if grep -rnE "VERSION_(1[89]|2[0-9])" node_modules/@capacitor-community/*/android/build.gradle; then
+            echo "::error::Plugin still requests Java > 17"; exit 1
+          fi
+
+      # ------------------------------------------------------------------
+      # Piper voices: bundled INSIDE the APK (no in-app download, no OPFS, works offline from first launch)
+      # ------------------------------------------------------------------
+      - name: Download Piper voice bundles and verify size / checksum
+        run: |
+          set -e
+          fetch() { # name expected_bytes
+            curl -fL --retry 3 -o "$1.tar.bz2" "$MODELS_URL/$1.tar.bz2"
+            got=$(stat -c %s "$1.tar.bz2")
+            [ "$got" = "$2" ] || { echo "::error::$1 size $got != expected $2 (upstream file changed - send this log to Claude)"; exit 1; }
+          }
+          fetch "$HI_BUNDLE" "$HI_BYTES"
+          fetch "$EN_BUNDLE" "$EN_BYTES"
+          echo "$HI_SHA256  $HI_BUNDLE.tar.bz2" | sha256sum -c - || { echo "::error::Hindi bundle checksum mismatch"; exit 1; }
+          EN_SHA=$(sha256sum "$EN_BUNDLE.tar.bz2" | cut -d' ' -f1)
+          mkdir -p dl && tar xjf "$HI_BUNDLE.tar.bz2" -C dl && tar xjf "$EN_BUNDLE.tar.bz2" -C dl
+          {
+            echo "### Voice bundles"
+            echo "- Hindi $HI_VOICE: $HI_BYTES bytes, sha256 verified"
+            echo "- English $EN_VOICE: $EN_BYTES bytes, sha256 \`$EN_SHA\` (pin this in the workflow to also verify English)"
+            echo "- Licenses: Hindi priyamvada = CC BY-NC-SA 4.0 (NON-COMMERCIAL, personal use only). English amy: see MODEL_CARD below"
+            echo '```'; cat "dl/$EN_BUNDLE/MODEL_CARD" 2>/dev/null | head -12; echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          # the phonemizer data must be identical, because the app ships it only once
+          diff -rq "dl/$HI_BUNDLE/espeak-ng-data" "dl/$EN_BUNDLE/espeak-ng-data" || { echo "::error::espeak-ng-data differs between Hindi and English bundle - the shared copy would be wrong"; exit 1; }
+          for f in "dl/$HI_BUNDLE/$HI_VOICE.onnx" "dl/$HI_BUNDLE/tokens.txt" "dl/$EN_BUNDLE/$EN_VOICE.onnx" "dl/$EN_BUNDLE/tokens.txt" \
+                   "dl/$HI_BUNDLE/espeak-ng-data/phondata" "dl/$HI_BUNDLE/espeak-ng-data/hi_dict" "dl/$HI_BUNDLE/espeak-ng-data/en_dict"; do
+            test -s "$f" || { echo "::error::Missing inside bundle: $f"; exit 1; }
+          done
+          V=android/app/src/main/assets/voices
+          mkdir -p "$V/$HI_VOICE" "$V/$EN_VOICE"
+          cp "dl/$HI_BUNDLE/$HI_VOICE.onnx" "dl/$HI_BUNDLE/tokens.txt" "$V/$HI_VOICE/"
+          cp "dl/$EN_BUNDLE/$EN_VOICE.onnx" "dl/$EN_BUNDLE/tokens.txt" "$V/$EN_VOICE/"
+          cp -r "dl/$HI_BUNDLE/espeak-ng-data" "$V/espeak-ng-data"
+          du -sh "$V"/* | tee -a "$GITHUB_STEP_SUMMARY"
+          rm -rf dl *.tar.bz2
+
+      - name: Add sherpa-onnx 1.13.8 and the native SherpaTts plugin
+        run: |
+          set -e
+          PKG=android/app/src/main/java/com/rohanchauhan/tradesjournal
+          mkdir -p "$PKG"
+          cp native/SherpaTtsPlugin.java "$PKG/SherpaTtsPlugin.java"
+          cat > "$PKG/MainActivity.java" <<'JAVA'
+          package com.rohanchauhan.tradesjournal;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(SherpaTtsPlugin.class);
+                  super.onCreate(savedInstanceState);
+              }
+          }
+          JAVA
+          node - <<'NODE'
+          const fs = require('fs');
+          const settings = 'android/settings.gradle';
+          let st = fs.readFileSync(settings, 'utf8');
+          // Official sherpa-onnx Android examples resolve this artifact from JitPack.
+          st = st.replace(/repositories\s*\{([\s\S]*?)\}/g, (block) => {
+            if (!block.includes('mavenCentral()') || block.includes('jitpack.io')) return block;
+            return block.replace('mavenCentral()', "mavenCentral()\n        maven { url 'https://jitpack.io' }");
+          });
+          if (!st.includes('jitpack.io')) {
+            console.error('::error::Could not add JitPack to Android dependency repositories');
+            process.exit(1);
+          }
+          fs.writeFileSync(settings, st);
+
+          const p = 'android/app/build.gradle';
+          let g = fs.readFileSync(p, 'utf8');
+          if (!g.includes('abiFilters')) {
+            if (!/defaultConfig\s*\{/.test(g)) throw new Error('defaultConfig block not found');
+            g = g.replace(/defaultConfig\s*\{/, match => match + "\n        ndk { abiFilters 'arm64-v8a' }");
+          }
+          if (!g.includes("androidResources { noCompress 'onnx' }")) {
+            if (!g.includes('compileSdk rootProject.ext.compileSdkVersion')) throw new Error('compileSdk insertion point not found');
+            g = g.replace('compileSdk rootProject.ext.compileSdkVersion', "compileSdk rootProject.ext.compileSdkVersion\n    androidResources { noCompress 'onnx' }");
+          }
+          const dep = "implementation 'com.github.k2-fsa.sherpa-onnx:sherpa-onnx:v" + process.env.SHERPA_VERSION + "'";
+          if (!g.includes(dep)) {
+            if (!/dependencies\s*\{/.test(g)) throw new Error('dependencies block not found');
+            g = g.replace(/dependencies\s*\{/, match => match + "\n    " + dep);
+          }
+          fs.writeFileSync(p, g);
+          console.log('Configured sherpa-onnx ' + process.env.SHERPA_VERSION + ' via JitPack (arm64-v8a).');
+          NODE
+          echo "----- android/settings.gradle -----"; cat android/settings.gradle
+          echo "----- android/app/build.gradle -----"; cat android/app/build.gradle
+
+      - name: Verify speech plugins, web files and voice assets before building
+        run: |
+          npm ls @capacitor-community/speech-recognition --depth=0
+          npm ls @capacitor-community/text-to-speech --depth=0
+          test -s www/voice-bridge.js
+          grep -q RCTextToSpeech www/voice-bridge.js
+          grep -q RCSpeechRecognition www/voice-bridge.js
+          for f in va-nlu va-io va-app va-core va-ui va-brain va-pro va-piper; do test -s www/$f.js; done
+          test -d node_modules/@capacitor-community/speech-recognition/android
+          test -d node_modules/@capacitor-community/text-to-speech/android
+          grep -q RECORD_AUDIO android/app/src/main/AndroidManifest.xml
+          grep -q RecognitionService android/app/src/main/AndroidManifest.xml
+          V=android/app/src/main/assets/voices
+          test -s "$V/$HI_VOICE/$HI_VOICE.onnx" && test -s "$V/$EN_VOICE/$EN_VOICE.onnx" && test -d "$V/espeak-ng-data" || { echo "::error::Piper voice files are missing before the build"; exit 1; }
+          test -s android/app/src/main/java/com/rohanchauhan/tradesjournal/SherpaTtsPlugin.java
+          grep -q "registerPlugin(SherpaTtsPlugin.class)" android/app/src/main/java/com/rohanchauhan/tradesjournal/MainActivity.java
+          grep -q "com.github.k2-fsa.sherpa-onnx:sherpa-onnx:v1.13.8" android/app/build.gradle
+          grep -q "jitpack.io" android/settings.gradle
+          echo "Plugins, bridge, Sherpa-ONNX 1.13.8 dependency, voice modules, Piper assets and manifest entries are present."
+
+      - name: Use the fixed signing key (APK updates over the old one, data stays)
+        run: |
+          mkdir -p ~/.android
+          cp rc-debug.keystore ~/.android/debug.keystore
+          keytool -list -keystore ~/.android/debug.keystore -storepass android | tail -2
+
+      - name: Build debug APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug
+
+      - name: Verify the built APK (fails loudly if Piper is missing)
+        run: |
+          APK=android/app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          SIZE=$(stat -c %s "$APK"); echo "APK size: $SIZE bytes"
+          [ "$SIZE" -gt 100000000 ] || { echo "::error::APK is only $SIZE bytes - Piper models are not inside it"; exit 1; }
+          unzip -l "$APK" > /tmp/apk.txt
+          for f in assets/public/index.html assets/public/voice-bridge.js assets/public/va-brain.js assets/public/va-pro.js assets/public/va-core.js assets/public/va-piper.js \
+                   "assets/voices/$HI_VOICE/$HI_VOICE.onnx" "assets/voices/$HI_VOICE/tokens.txt" \
+                   "assets/voices/$EN_VOICE/$EN_VOICE.onnx" "assets/voices/$EN_VOICE/tokens.txt" \
+                   assets/voices/espeak-ng-data/phondata assets/voices/espeak-ng-data/hi_dict assets/voices/espeak-ng-data/en_dict \
+                   lib/arm64-v8a/libsherpa-onnx-jni.so AndroidManifest.xml; do
+            grep -q "$f" /tmp/apk.txt || { echo "::error::Missing inside APK: $f"; exit 1; }
+          done
+          unzip -p "$APK" 'classes*.dex' | strings | grep -q "SherpaTtsPlugin" || { echo "::error::SherpaTtsPlugin class is not in the APK dex"; exit 1; }
+          {
+            echo "### APK"
+            echo "- size: $((SIZE/1048576)) MB"
+            echo '- biggest entries:'; echo '```'
+            unzip -lv "$APK" | sort -k1 -n -r | head -8
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          keytool -printcert -jarfile "$APK" 2>&1 | grep -E "Owner|SHA256" | tee -a "$GITHUB_STEP_SUMMARY" || true
+          echo "APK verified: web files, Piper models, eSpeak-NG data, sherpa-onnx native library, plugin class and signature present." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RC-Trading-Journal-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
