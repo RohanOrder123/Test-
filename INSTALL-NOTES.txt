@@ -1,0 +1,4 @@
+Replace these four files at the same paths in your GitHub repository.
+Do not replace existing JavaScript files, capacitor.config.json, package.json, or rc-debug.keystore.
+The workflow pins Sherpa-ONNX 1.13.8 using the documented JitPack dependency.
+After a successful build, run both Hindi and English selfTest calls and verify audible playback on Android.
