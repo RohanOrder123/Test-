@@ -51,7 +51,7 @@ import java.util.concurrent.atomic.AtomicReference;
  *   speak({voice,text,speed})     -> plays natively; resolves when finished OR interrupted (never hangs)
  *   stop()                        -> stops playback, resolves the pending speak() immediately
  *   preload({voice})              -> loads a voice into memory
- * Error codes: NO_ASSET, NATIVE_LIB, INIT_FAIL, GEN_FAIL, NO_AUDIO, BAD_ARGS
+ * Error codes: NO_ASSET, NATIVE_LIB, INIT_FAIL, PHONEMIZER_FAIL, GEN_FAIL, NO_AUDIO, BAD_ARGS
  */
 @CapacitorPlugin(name = "SherpaTts")
 public class SherpaTtsPlugin extends Plugin {
@@ -154,21 +154,38 @@ public class SherpaTtsPlugin extends Plugin {
         f.delete();
     }
 
-    /** espeak-ng-data is copied once; a marker file proves the copy finished (survives app restarts). */
+    /**
+     * Piper VITS in sherpa-onnx 1.13.8 uses the bundled eSpeak-NG phonemizer.
+     * Copy the APK assets to filesDir (the native phonemizer needs real paths),
+     * then validate the files before trusting the completion marker.
+     */
     private synchronized String ensureEspeak() throws VoiceErr {
         if (espeakDir != null) return espeakDir;
         File root = getContext().getFilesDir();
         File dst = new File(root, "espeak-ng-data");
         File mark = new File(root, ESPEAK_MARK);
+        String[] required = new String[]{"phondata", "phonindex", "phontab", "intonations", "en_dict", "hi_dict"};
         try {
-            if (!(mark.exists() && dst.isDirectory())) {
+            boolean complete = mark.isFile() && dst.isDirectory();
+            if (complete) {
+                for (String name : required) {
+                    File f = new File(dst, name);
+                    if (!f.isFile() || f.length() == 0) { complete = false; break; }
+                }
+            }
+            if (!complete) {
                 deleteTree(dst);
+                if (mark.exists() && !mark.delete()) throw new IOException("cannot remove stale eSpeak marker");
                 int n = copyAssetDir(getContext().getAssets(), "voices/espeak-ng-data", dst);
-                if (n < 20) throw new IOException("only " + n + " espeak files found in APK assets");
-                if (!mark.exists() && !mark.createNewFile()) throw new IOException("cannot write marker");
+                if (n < 20) throw new IOException("only " + n + " eSpeak files copied; expected a complete data directory");
+                for (String name : required) {
+                    File f = new File(dst, name);
+                    if (!f.isFile() || f.length() == 0) throw new IOException("missing/empty eSpeak phonemizer file: " + name);
+                }
+                if (!mark.createNewFile()) throw new IOException("cannot write eSpeak completion marker");
             }
         } catch (IOException e) {
-            throw new VoiceErr("NO_ASSET", "espeak-ng-data: " + e.getMessage());
+            throw new VoiceErr("PHONEMIZER_FAIL", "eSpeak-NG phonemizer data is incomplete: " + e.getMessage());
         }
         espeakDir = dst.getAbsolutePath();
         return espeakDir;
@@ -371,27 +388,53 @@ public class SherpaTtsPlugin extends Plugin {
     @PluginMethod
     public void selfTest(final PluginCall call) {
         final String voice = call.getString("voice");
-        final String text = call.getString("text", "test");
+        final String text = call.getString("text", "Offline Piper voice verification.");
+        if (voice == null || voice.trim().isEmpty() || text == null || text.trim().isEmpty()) {
+            call.reject("voice and non-empty text are required", "BAD_ARGS");
+            return;
+        }
         exec.execute(() -> {
             try {
                 long t0 = SystemClock.elapsedRealtime();
                 OfflineTts t = load(voice);
                 long initMs = since(t0);
+                String phonemizerDir = ensureEspeak();
                 long t1 = SystemClock.elapsedRealtime();
-                GeneratedAudio a = t.generate(text, 0, 1.0f);
+                final GeneratedAudio a;
+                try {
+                    a = t.generate(text.trim(), 0, 1.0f);
+                } catch (Throwable e) {
+                    throw new VoiceErr("PHONEMIZER_FAIL",
+                            "Piper text-to-phoneme/audio generation failed: " +
+                            e.getClass().getSimpleName() + ": " + e.getMessage());
+                }
                 long genMs = since(t1);
-                float[] s = a.getSamples();
+                float[] samples = a == null ? null : a.getSamples();
+                int sampleRate = a == null ? 0 : a.getSampleRate();
                 float peak = 0f;
-                if (s != null) for (float v : s) peak = Math.max(peak, Math.abs(v));
-                double secs = (s == null ? 0 : s.length) / (double) Math.max(1, a.getSampleRate());
+                if (samples != null) for (float v : samples) {
+                    if (!Float.isNaN(v) && !Float.isInfinite(v)) peak = Math.max(peak, Math.abs(v));
+                }
+                double secs = (samples == null || sampleRate <= 0)
+                        ? 0 : samples.length / (double) sampleRate;
+                if (samples == null || samples.length == 0 || sampleRate <= 0 || peak <= 0.0001f || secs <= 0) {
+                    throw new VoiceErr("NO_AUDIO", "Piper generated no usable audio (samples=" +
+                            (samples == null ? 0 : samples.length) + ", sampleRate=" + sampleRate +
+                            ", peak=" + peak + ", durationSec=" + secs + "). Check the voice model, tokens and eSpeak-NG data.");
+                }
                 JSObject o = new JSObject();
-                o.put("ok", s != null && s.length > 0 && peak > 0.01f);
+                o.put("ok", true);
+                o.put("modelLoaded", true);
+                o.put("phonemizerOk", true);
+                o.put("phonemizer", "eSpeak-NG");
+                o.put("phonemizerDataReady", new File(phonemizerDir).isDirectory());
                 o.put("initMs", initMs);
                 o.put("synthMs", genMs);
+                o.put("samples", samples.length);
                 o.put("audioSec", Math.round(secs * 100) / 100.0);
-                o.put("sampleRate", a.getSampleRate());
+                o.put("sampleRate", sampleRate);
                 o.put("peak", Math.round(peak * 1000) / 1000.0);
-                o.put("rtf", secs > 0 ? Math.round(genMs / 1000.0 / secs * 100) / 100.0 : -1);
+                o.put("rtf", Math.round(genMs / 1000.0 / secs * 100) / 100.0);
                 call.resolve(o);
             } catch (VoiceErr e) {
                 call.reject(e.getMessage(), e.code);
